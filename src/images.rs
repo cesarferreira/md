@@ -1,13 +1,15 @@
-//! Image loading. Local files and data URLs load on demand; remote URLs are
-//! fetched on a background thread so the page can draw before they arrive.
+//! Image loading. Local files and data URLs load on demand. Remote images come
+//! from a disk cache when one exists, and otherwise from one shared HTTP client
+//! so badges on the same host share a connection.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use image::RgbaImage;
 use resvg::{tiny_skia, usvg};
@@ -36,10 +38,21 @@ enum Entry {
     Failed,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ImageStore {
     remote: Arc<Mutex<HashMap<String, Entry>>>,
     updated: Arc<AtomicBool>,
+    cache_dir: Arc<PathBuf>,
+}
+
+impl Default for ImageStore {
+    fn default() -> Self {
+        Self {
+            remote: Arc::new(Mutex::new(HashMap::new())),
+            updated: Arc::new(AtomicBool::new(false)),
+            cache_dir: Arc::new(default_cache_dir()),
+        }
+    }
 }
 
 impl ImageStore {
@@ -68,52 +81,166 @@ impl ImageStore {
         self.updated.swap(false, Ordering::AcqRel)
     }
 
+    /// True while a remote image is still on the network.
+    pub fn pending(&self) -> bool {
+        self.remote
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .values()
+            .any(|entry| matches!(entry, Entry::Pending))
+    }
+
     fn remote(&self, url: &str) -> Lookup {
-        let mut entries = self.remote.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(lookup) = self.cached_lookup(url) {
+            return lookup;
+        }
+        // A fresh copy is already on disk: decode it now so the first frame
+        // has the picture, and refresh it quietly once it gets old.
+        if let Some((bytes, fresh)) = read_cache(&self.cache_dir, url)
+            && let Some(picture) = decode(&bytes)
+        {
+            let picture = Arc::new(picture);
+            self.remember(url, Entry::Ready(Arc::clone(&picture)));
+            if !fresh {
+                self.spawn_fetch(url);
+            }
+            return Lookup::Ready(picture);
+        }
+        if self.mark_pending(url) {
+            self.spawn_fetch(url);
+        }
+        self.cached_lookup(url).unwrap_or(Lookup::Pending)
+    }
+
+    fn cached_lookup(&self, url: &str) -> Option<Lookup> {
+        let entries = self.remote.lock().unwrap_or_else(|err| err.into_inner());
         match entries.get(url) {
-            Some(Entry::Ready(picture)) => return Lookup::Ready(Arc::clone(picture)),
-            Some(Entry::Pending) => return Lookup::Pending,
-            Some(Entry::Failed) => return Lookup::Missing,
-            None => {}
+            Some(Entry::Ready(picture)) => Some(Lookup::Ready(Arc::clone(picture))),
+            Some(Entry::Pending) => Some(Lookup::Pending),
+            Some(Entry::Failed) => Some(Lookup::Missing),
+            None => None,
+        }
+    }
+
+    fn remember(&self, url: &str, entry: Entry) {
+        self.remote
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(url.to_owned(), entry);
+    }
+
+    /// Returns true when this call is the one that should start the download.
+    fn mark_pending(&self, url: &str) -> bool {
+        let mut entries = self.remote.lock().unwrap_or_else(|err| err.into_inner());
+        if entries.contains_key(url) {
+            return false;
         }
         entries.insert(url.to_owned(), Entry::Pending);
-        drop(entries);
+        true
+    }
 
+    fn spawn_fetch(&self, url: &str) {
         let remote = Arc::clone(&self.remote);
         let updated = Arc::clone(&self.updated);
+        let cache_dir = Arc::clone(&self.cache_dir);
         let url = url.to_owned();
         thread::spawn(move || {
-            let entry = download(&url)
-                .and_then(|bytes| decode(&bytes))
-                .map_or(Entry::Failed, |picture| Entry::Ready(Arc::new(picture)));
-            remote
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .insert(url, entry);
-            updated.store(true, Ordering::Release);
+            let Some(bytes) = download(&url) else {
+                let mut entries = remote.lock().unwrap_or_else(|err| err.into_inner());
+                if matches!(entries.get(&url), Some(Entry::Pending) | None) {
+                    entries.insert(url, Entry::Failed);
+                    updated.store(true, Ordering::Release);
+                }
+                return;
+            };
+            write_cache(&cache_dir, &url, &bytes);
+            let Some(picture) = decode(&bytes) else {
+                let mut entries = remote.lock().unwrap_or_else(|err| err.into_inner());
+                if matches!(entries.get(&url), Some(Entry::Pending) | None) {
+                    entries.insert(url, Entry::Failed);
+                    updated.store(true, Ordering::Release);
+                }
+                return;
+            };
+            let picture = Arc::new(picture);
+            let mut entries = remote.lock().unwrap_or_else(|err| err.into_inner());
+            let changed = !matches!(
+                entries.get(&url),
+                Some(Entry::Ready(old)) if old.pixels.as_raw() == picture.pixels.as_raw()
+            );
+            entries.insert(url, Entry::Ready(picture));
+            drop(entries);
+            if changed {
+                updated.store(true, Ordering::Release);
+            }
         });
-        Lookup::Pending
+    }
+}
+
+/// Show a cached image immediately, and fetch a new copy after this age.
+const CACHE_FRESH: Duration = Duration::from_secs(6 * 60 * 60);
+
+fn default_cache_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("md").join("images")
+}
+
+fn cache_path(dir: &Path, url: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    dir.join(format!("{hash:016x}"))
+}
+
+fn read_cache(dir: &Path, url: &str) -> Option<(Vec<u8>, bool)> {
+    let path = cache_path(dir, url);
+    let bytes = fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let fresh = fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < CACHE_FRESH);
+    Some((bytes, fresh))
+}
+
+fn write_cache(dir: &Path, url: &str, bytes: &[u8]) {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = cache_path(dir, url);
+    let temporary = path.with_extension("part");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(&temporary, &path);
     }
 }
 
 fn download(url: &str) -> Option<Vec<u8>> {
-    let output = Command::new("curl")
-        .args([
-            "--silent",
-            "--fail",
-            "--location",
-            "--max-time",
-            "10",
-            "--max-filesize",
-            "25000000",
-            "--url",
-        ])
-        .arg(url)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+    let response = client().get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(25_000_000)
+        .read_to_end(&mut bytes)
         .ok()?;
-    (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+fn client() -> &'static ureq::Agent {
+    static CLIENT: OnceLock<ureq::Agent> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(8))
+            .user_agent("md")
+            .build()
+    })
 }
 
 fn decode(bytes: &[u8]) -> Option<Picture> {
@@ -177,12 +304,31 @@ fn rasterize_svg(bytes: &[u8]) -> Option<Picture> {
     })
 }
 
-/// Badge SVGs carry their label as `<text>`, so they need system fonts.
+/// Badge SVGs name a sans face such as Verdana. Load those files directly.
+/// Scanning every installed font is what made the first badges take seconds.
 fn svg_fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     Arc::clone(FONTS.get_or_init(|| {
         let mut fonts = usvg::fontdb::Database::new();
-        fonts.load_system_fonts();
+        for path in [
+            "/System/Library/Fonts/Supplemental/Verdana.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ] {
+            let _ = fonts.load_font_file(path);
+        }
+        if fonts.is_empty() {
+            fonts.load_system_fonts();
+        }
+        let fallback = fonts
+            .faces()
+            .find_map(|face| face.families.first().map(|(name, _)| name.clone()));
+        if let Some(name) = fallback {
+            fonts.set_sans_serif_family(name.clone());
+            fonts.set_serif_family(name);
+        }
         Arc::new(fonts)
     }))
 }
@@ -213,6 +359,24 @@ mod tests {
             Path::new("."),
         );
         assert!(matches!(lookup, Lookup::Ready(picture) if picture.width == 80.0));
+    }
+
+    #[test]
+    fn a_cached_remote_image_is_ready_without_a_fetch() {
+        let dir = std::env::temp_dir().join(format!("md-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let url = "https://img.shields.io/badge/license-MIT-green";
+        fs::write(cache_path(&dir, url), BADGE.as_bytes()).unwrap();
+        let store = ImageStore {
+            remote: Arc::new(Mutex::new(HashMap::new())),
+            updated: Arc::new(AtomicBool::new(false)),
+            cache_dir: Arc::new(dir.clone()),
+        };
+        let lookup = store.get(url, Path::new("."));
+        assert!(matches!(lookup, Lookup::Ready(picture) if picture.width == 80.0));
+        assert!(!store.pending());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

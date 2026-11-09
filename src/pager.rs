@@ -189,7 +189,14 @@ impl App {
             if dirty && !self.help {
                 self.present()?;
             }
-            if !event::poll(Duration::from_millis(150))? {
+            // Poll quickly while badges are in flight so they appear with the page
+            // instead of on the next keypress.
+            let wait = if self.renderer.images_pending() {
+                Duration::from_millis(20)
+            } else {
+                Duration::from_millis(150)
+            };
+            if !event::poll(wait)? {
                 continue;
             }
             match event::read()? {

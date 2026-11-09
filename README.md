@@ -69,7 +69,7 @@ md README.md
 md < README.md
 ```
 
-`j`/`k` scroll, click a link, drag and press `y` to copy, `+`/`-` zoom, `?` lists every key, `q` quits. Saving the file updates the preview, scrolls to the first block that changed, and marks it. `--theme dark|light|auto` follows the terminal background by default. Remote images such as badges are fetched with `curl` in the background.
+`j`/`k` scroll, click a link, drag and press `y` to copy, `+`/`-` zoom, `?` lists every key, `q` quits. Saving the file updates the preview, scrolls to the first block that changed, and marks it. `--theme dark|light|auto` follows the terminal background by default. Remote images such as badges are fetched in the background and cached, so the next open shows them immediately.
 
 ## License
 

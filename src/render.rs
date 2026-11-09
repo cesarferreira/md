@@ -373,6 +373,11 @@ impl Renderer {
         self.images.take_updated()
     }
 
+    /// True while a badge or other remote image is still downloading.
+    pub fn images_pending(&self) -> bool {
+        self.images.pending()
+    }
+
     /// `text_px` is the body text size at zoom 1. Pass the terminal's text
     /// size so the page reads at the same scale as the terminal.
     pub fn render(
@@ -384,9 +389,37 @@ impl Renderer {
         text_px: f32,
         base_dir: &Path,
     ) -> Page {
+        warm_images(&self.images, &doc.blocks);
         let mut lay = Layouter::new(self, theme, zoom, text_px, viewport_width, base_dir);
         lay.render_blocks(&doc.blocks, lay.left, lay.content_width);
         lay.finish()
+    }
+}
+
+/// Start remote image loads before text layout, so a cached badge is ready for
+/// the first frame and a missing one is already on the network.
+fn warm_images(images: &ImageStore, blocks: &[Section]) {
+    for section in blocks {
+        match &section.block {
+            Block::Images(list) => {
+                for image in list {
+                    if image.dest.starts_with("http://") || image.dest.starts_with("https://") {
+                        let _ = images.get(&image.dest, Path::new(""));
+                    }
+                }
+            }
+            Block::Center(inner)
+            | Block::Quote(inner)
+            | Block::Details { blocks: inner, .. }
+            | Block::Footnote { blocks: inner, .. }
+            | Block::Alert { blocks: inner, .. } => warm_images(images, inner),
+            Block::List { items, .. } => {
+                for item in items {
+                    warm_images(images, &item.blocks);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
