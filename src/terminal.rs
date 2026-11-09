@@ -13,7 +13,7 @@ use crossterm::terminal::{
 };
 
 use crate::protocol::{
-    delete_image, parse_background, parse_cell_size, parse_palette, parse_window_pixels,
+    delete_image, has_attributes_reply, parse_background, parse_cell_size, parse_palette, parse_window_pixels,
     probe_query, supports_graphics,
 };
 
@@ -158,10 +158,13 @@ fn read_reply(timeout: Duration) -> String {
 
 fn response_ready(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
-    let base = supports_graphics(&text)
+    // The device-attributes reply is queried last, so everything the terminal
+    // will answer has arrived once it is here.
+    if has_attributes_reply(&text) {
+        return true;
+    }
+    supports_graphics(&text)
         && (parse_cell_size(&text).is_some() || parse_window_pixels(&text).is_some())
-        && (parse_background(&text).is_some() || text.contains('c'));
-    // Keep reading until the ANSI palette arrives, so syntax colors can follow
-    // the terminal theme. Terminals that never answer still fall through on timeout.
-    base && parse_palette(&text).iter().flatten().count() == 16
+        && parse_background(&text).is_some()
+        && parse_palette(&text).iter().flatten().count() == 16
 }

@@ -4,12 +4,24 @@ const CHUNK: usize = 4096;
 
 pub fn probe_query() -> String {
     let mut query = String::from(
-        "\u{1b}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\u{1b}\\\u{1b}[c\u{1b}[16t\u{1b}[14t\u{1b}]11;?\u{1b}\\",
+        "\u{1b}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\u{1b}\\\u{1b}[16t\u{1b}[14t\u{1b}]11;?\u{1b}\\",
     );
     for index in 0..16 {
         query.push_str(&format!("\u{1b}]4;{index};?\u{1b}\\"));
     }
+    // Device attributes go last. Terminals answer in order and every terminal
+    // answers this one, so its reply marks the end of all the others.
+    query.push_str("\u{1b}[c");
     query
+}
+
+/// True once the reply to the trailing device-attributes query (`CSI ? ... c`) is in.
+pub fn has_attributes_reply(response: &str) -> bool {
+    response.match_indices("\u{1b}[?").any(|(at, _)| {
+        let tail = &response[at + 3..];
+        let digits = tail.trim_start_matches(|c: char| c.is_ascii_digit() || c == ';');
+        digits.starts_with('c')
+    })
 }
 
 pub fn supports_graphics(response: &str) -> bool {
@@ -158,6 +170,14 @@ fn scale_hex(value: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attributes_query_is_last_and_its_reply_ends_the_probe() {
+        assert!(super::probe_query().ends_with("\u{1b}[c"));
+        assert!(super::has_attributes_reply("\u{1b}_Gi=31;OK\u{1b}\\\u{1b}[?62;4c"));
+        assert!(!super::has_attributes_reply("\u{1b}[6;20;10t"));
+        assert!(!super::has_attributes_reply("\u{1b}[?62;4"));
+    }
+
     use super::*;
 
     #[test]
