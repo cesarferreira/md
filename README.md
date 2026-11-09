@@ -64,9 +64,14 @@ make build-release
 <a id="quickstart"></a>
 ## Quickstart
 
+`md` renders a Markdown file into the terminal with the kitty graphics protocol. It works in kitty, Ghostty, WezTerm, and any other terminal that speaks that protocol.
+
 ```bash
-md --help
+md README.md
+md < README.md
 ```
+
+`j`/`k` scroll, click a link, drag and press `y` to copy, `+`/`-` zoom, `?` lists every key, `q` quits. Saving the file updates the preview, scrolls to the first block that changed, and marks it. `--theme dark|light|auto` follows the terminal background by default. Remote images such as badges are fetched with `curl` in the background.
 
 <a id="development"></a>
 ## Development
@@ -79,7 +84,7 @@ make build        # debug build
 make build-release
 make install      # install debug binary
 make install-release
-make run ARGS="--hello"
+make run ARGS="README.md"
 make check        # cargo check + clippy
 make fmt          # format
 make lint         # fmt check + clippy

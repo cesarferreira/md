@@ -14,7 +14,25 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arboard = "3.7.0"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+comrak = { version = "0.55", default-features = false }
+cosmic-text = "0.17"
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+libc = "0.2"
+notify = "8"
+open = "5"
+resvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts"] }
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-fancy",
+    "dump-load",
+    "default-syntaxes",
+    "default-themes",
+] }
+tiny-skia = "0.11"
 
 [profile.release]
 lto = "thin"
