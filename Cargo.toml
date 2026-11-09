@@ -1,0 +1,23 @@
+[package]
+name = "md"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Preview Markdown with kitty graphics"
+license = "MIT"
+authors = ["Cesar Ferreira"]
+repository = "https://github.com/cesarferreira/md"
+
+[[bin]]
+name = "md"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
