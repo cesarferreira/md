@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::MoveTo;
@@ -134,6 +134,10 @@ struct App {
     mark_line: Option<u32>,
     shown: Option<Shown>,
     image_dirty: bool,
+    /// Column count the current page was laid out for.
+    rendered_cols: u16,
+    /// Set while the window is changing, so the reflow waits until it settles.
+    resize_at: Option<Instant>,
 }
 
 impl App {
@@ -172,6 +176,8 @@ impl App {
             mark_line: None,
             shown: None,
             image_dirty: true,
+            rendered_cols: cols,
+            resize_at: None,
         };
         app.note_stamp();
         app.rewatch();
@@ -191,28 +197,35 @@ impl App {
             }
             // Poll quickly while badges are in flight so they appear with the page
             // instead of on the next keypress.
-            let wait = if self.renderer.images_pending() {
+            let wait = if self.resize_at.is_some() {
+                Duration::from_millis(80)
+            } else if self.renderer.images_pending() {
                 Duration::from_millis(20)
             } else {
                 Duration::from_millis(150)
             };
             if !event::poll(wait)? {
+                if self.resize_at.is_some() {
+                    self.settle_resize()?;
+                }
                 continue;
             }
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if self.on_key(key)? {
-                        break;
+                Event::Resize(cols, rows) => self.note_resize(cols, rows)?,
+                other => {
+                    if self.resize_at.is_some() {
+                        self.settle_resize()?;
+                    }
+                    match other {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            if self.on_key(key)? {
+                                break;
+                            }
+                        }
+                        Event::Mouse(mouse) => self.on_mouse(mouse)?,
+                        _ => {}
                     }
                 }
-                Event::Mouse(mouse) => self.on_mouse(mouse)?,
-                Event::Resize(cols, rows) => {
-                    self.cols = cols.max(1);
-                    self.rows = rows.max(1);
-                    self.rerender();
-                    self.present()?;
-                }
-                _ => {}
             }
         }
         Ok(())
@@ -519,8 +532,53 @@ impl App {
         self.page = self
             .renderer
             .render(&doc, width, &theme, self.zoom, text_px, &base);
+        self.rendered_cols = self.cols;
         self.image_dirty = true;
         self.clamp();
+    }
+
+    /// Track the new size and stretch the current picture to fill it. The
+    /// reflow happens once the resize stops, not on every event in the drag.
+    fn note_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.cols = cols.max(1);
+        self.rows = rows.max(1);
+        self.resize_at = Some(Instant::now());
+        self.restretch()
+    }
+
+    fn settle_resize(&mut self) -> io::Result<()> {
+        if self.resize_at.take().is_none() {
+            return Ok(());
+        }
+        if self.cols != self.rendered_cols {
+            self.rerender();
+        }
+        self.present()
+    }
+
+    /// Move the image already on screen to the new window, without encoding pixels.
+    fn restretch(&mut self) -> io::Result<()> {
+        if self.help {
+            return Ok(());
+        }
+        let theme = Theme::choose(self.theme, self.background, &self.palette);
+        let (image_cols, image_rows, view_w, view_h) = self.grid();
+        let mut out = io::stdout().lock();
+        execute!(out, MoveTo(0, 0))?;
+        if let Some(shown) = self.shown {
+            // Keep the pixels at 1:1. Filling the new cell grid would squash the
+            // page for the whole drag and snap it back when the reflow lands.
+            let (x, y, w, h) = shown.source(px(self.scroll_x), px(self.scroll_y), view_w, view_h);
+            let cols = cells_for(w, self.cell_w, image_cols);
+            let rows = cells_for(h, self.cell_h, image_rows);
+            write!(
+                out,
+                "{}",
+                place_image(shown.id, 1, SourceRect { x, y, w, h }, cols, rows)
+            )?;
+        }
+        self.write_status(&mut out, &theme)?;
+        Ok(())
     }
 
     fn present(&mut self) -> io::Result<()> {
@@ -951,6 +1009,12 @@ impl Shown {
 
 fn px(value: f32) -> u32 {
     if value <= 0.0 { 0 } else { value as u32 }
+}
+
+/// Cell count that displays `pixels` at the terminal's cell size, never past the window.
+fn cells_for(pixels: u32, cell: u32, window: u16) -> u32 {
+    let count = (pixels as f32 / cell.max(1) as f32).round() as u32;
+    count.clamp(1, u32::from(window.max(1)))
 }
 
 /// Vertical slice of the page to upload. Scrolling inside it is only a place command.

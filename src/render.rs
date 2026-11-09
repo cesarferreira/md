@@ -13,8 +13,9 @@ use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
 use tiny_skia::{Pixmap, PremultipliedColorU8};
 
 use crate::document::{
-    AlertKind, Align, Block, Document, ImageRef, Inline, Item, Section, plain, slug,
+    AlertKind, Align, Block, Document, ImageRef, ImageWidth, Inline, Item, Section, plain, slug,
 };
+use crate::fasttext::{FastText, LayoutOpts, Spec};
 use crate::images::{ImageStore, Lookup, Picture};
 use crate::page::{Atom, Frame, Rect, Region, RegionKind};
 
@@ -255,6 +256,7 @@ pub struct Renderer {
     fonts: FontSystem,
     cache: SwashCache,
     syntax: SyntaxSet,
+    fast: FastText,
     images: ImageStore,
     /// `<details>` blocks, by document order, whose open state the user flipped.
     toggled: HashSet<usize>,
@@ -266,6 +268,7 @@ impl Renderer {
             fonts: FontSystem::new(),
             cache: SwashCache::new(),
             syntax: SyntaxSet::load_defaults_newlines(),
+            fast: FastText::new(),
             images: ImageStore::default(),
             toggled: HashSet::new(),
         }
@@ -429,6 +432,7 @@ impl Default for Renderer {
     }
 }
 
+#[derive(Clone)]
 struct SpanStyle {
     weight: Weight,
     font_style: FontStyle,
@@ -498,6 +502,7 @@ enum Op {
         pixels: Vec<u8>,
     },
     Text(TextOp),
+    Glyphs(Vec<crate::fasttext::Ink>),
 }
 
 struct RowItem {
@@ -512,13 +517,6 @@ enum RowKind {
     Label(String),
 }
 
-struct RowMetrics {
-    x: f32,
-    col_w: f32,
-    inner: f32,
-    pad: f32,
-}
-
 struct TextOp {
     buffer: Buffer,
     x: f32,
@@ -530,6 +528,7 @@ struct TextOp {
 
 struct Layouter<'a> {
     fonts: &'a mut FontSystem,
+    fast: &'a mut FastText,
     cache: &'a mut SwashCache,
     syntax: &'a SyntaxSet,
     images: &'a ImageStore,
@@ -577,6 +576,7 @@ impl<'a> Layouter<'a> {
         let left = pad + (inner - content_width) / 2.0;
         Self {
             fonts: &mut renderer.fonts,
+            fast: &mut renderer.fast,
             cache: &mut renderer.cache,
             syntax: &renderer.syntax,
             images: &renderer.images,
@@ -756,22 +756,23 @@ impl<'a> Layouter<'a> {
         let pad = 12.0 * self.zoom;
         let y0 = self.y;
         let lines = self.highlight(lang, literal);
+        // One buffer for the whole block. Shaping each line on its own is what
+        // made a long README take a third of a second, and a resize did it again.
+        let mut pieces = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                pieces.push(("\n".to_owned(), self.code_style(self.theme.code_fg)));
+            }
+            pieces.extend(line.iter().cloned());
+        }
         let ops_before = self.ops.len();
-        let mut max_w = 0.0_f32;
         self.y += pad;
-        for line in &lines {
-            let (text_w, text_h) = self.layout_pieces(line, x + pad, self.y, None);
-            max_w = max_w.max(text_w);
-            self.y += if text_h > 0.0 {
-                text_h
-            } else {
-                self.line * 0.9
-            };
-        }
-        if lines.is_empty() {
-            self.y += self.line;
-        }
+        let (text_w, text_h) = self.layout_pieces(&pieces, x + pad, self.y, None);
+        let line_h = self.body * 0.92 * 1.45;
+        let min_h = line_h * lines.len().max(1) as f32;
+        self.y += if text_h > 1.0 { text_h } else { min_h };
         self.y += pad;
+        let max_w = text_w;
         let block_w = (max_w + pad * 2.0).max(width);
         self.ops.insert(
             ops_before,
@@ -896,82 +897,154 @@ impl<'a> Layouter<'a> {
         width: f32,
     ) {
         let cols = header.len().max(rows.first().map_or(1, Vec::len)).max(1);
-        let col_w = (width / cols as f32).max(48.0 * self.zoom);
-        let pad = 8.0 * self.zoom;
-        let inner = (col_w - pad * 2.0).max(16.0);
-        let y0 = self.y;
-        let metrics = RowMetrics {
-            x,
-            col_w,
-            inner,
-            pad,
-        };
-        self.paint_row(header, aligns, &metrics, true);
-        let header_bottom = self.y;
+        let mut grid: Vec<&[Vec<Inline>]> = Vec::with_capacity(1 + rows.len());
+        grid.push(header);
         for row in rows {
-            self.paint_row(row, aligns, &metrics, false);
+            grid.push(row.as_slice());
         }
-        let table_w = col_w * cols as f32;
-        let table_h = self.y - y0;
-        self.ops.push(Op::Fill {
-            x,
-            y: y0,
+        let pad_x = 12.0 * self.zoom;
+        let pad_y = 7.0 * self.zoom;
+        let floor = pad_x * 2.0 + 8.0 * self.zoom;
+        let mut min_w = vec![floor; cols];
+        let mut max_w = vec![floor; cols];
+        for (index, row) in grid.iter().enumerate() {
+            let style = self.table_style(index == 0);
+            for (col, cell) in row.iter().enumerate().take(cols) {
+                let (natural, _) = self.measure_inlines(cell, None, &style);
+                let word = longest_word(cell);
+                let (word_w, _) = if word.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    self.measure_inlines(&[Inline::Text(word)], None, &style)
+                };
+                let min = word_w.max(8.0 * self.zoom) + pad_x * 2.0;
+                let max = natural.max(word_w).max(8.0 * self.zoom) + pad_x * 2.0;
+                min_w[col] = min_w[col].max(min);
+                max_w[col] = max_w[col].max(max.max(min_w[col]));
+            }
+        }
+        let widths = column_widths(&min_w, &max_w, width);
+        let table_w: f32 = widths.iter().sum();
+        let origin = if self.center {
+            x + ((width - table_w) / 2.0).max(0.0)
+        } else {
+            x
+        };
+        let mut stops = Vec::with_capacity(cols + 1);
+        stops.push(origin);
+        for column in &widths {
+            let edge = stops.last().copied().unwrap_or(origin) + column;
+            stops.push(edge);
+        }
+
+        let ops_before = self.ops.len();
+        let top = self.y;
+        let mut bands = Vec::with_capacity(grid.len());
+        for (index, row) in grid.iter().enumerate() {
+            let header_row = index == 0;
+            let style = self.table_style(header_row);
+            let y0 = self.y;
+            let mut text_w = vec![0.0; cols];
+            let mut text_h = vec![self.line; cols];
+            for col in 0..cols {
+                let Some(cell) = row.get(col) else {
+                    continue;
+                };
+                let inner = (widths[col] - pad_x * 2.0).max(1.0);
+                let (measured_w, measured_h) = self.measure_inlines(cell, Some(inner), &style);
+                text_w[col] = measured_w;
+                text_h[col] = measured_h.max(self.line * 0.6);
+            }
+            let row_text = text_h.iter().copied().fold(self.line, f32::max);
+            let row_h = row_text + pad_y * 2.0;
+            for col in 0..cols {
+                let Some(cell) = row.get(col) else {
+                    continue;
+                };
+                if cell.is_empty() {
+                    continue;
+                }
+                let inner = (widths[col] - pad_x * 2.0).max(1.0);
+                let align = aligns.get(col).copied().unwrap_or(Align::None);
+                let shift = match align {
+                    Align::Center => ((inner - text_w[col]) / 2.0).max(0.0),
+                    Align::Right => (inner - text_w[col]).max(0.0),
+                    Align::Left | Align::None => 0.0,
+                };
+                let rise = ((row_h - pad_y * 2.0 - text_h[col]) / 2.0).max(0.0);
+                let pieces = flatten(cell, &style, self.theme.link, self.theme.code_fg);
+                self.layout_pieces(
+                    &pieces,
+                    stops[col] + pad_x + shift,
+                    y0 + pad_y + rise,
+                    Some(inner),
+                );
+            }
+            self.y = y0 + row_h;
+            bands.push((y0, row_h, header_row));
+        }
+        let bottom = self.y;
+        let rule = self.zoom.max(1.0);
+        let mut chrome = Vec::new();
+        for (index, (y0, row_h, header_row)) in bands.iter().enumerate() {
+            let color = if *header_row {
+                Some(table_header_bg(self.theme))
+            } else if index % 2 == 0 {
+                Some(table_stripe(self.theme))
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                chrome.push(Op::Fill {
+                    x: origin,
+                    y: *y0,
+                    w: table_w,
+                    h: *row_h,
+                    color,
+                });
+            }
+        }
+        for (y0, _, _) in &bands {
+            chrome.push(Op::Fill {
+                x: origin,
+                y: *y0,
+                w: table_w,
+                h: rule,
+                color: self.theme.border,
+            });
+        }
+        chrome.push(Op::Fill {
+            x: origin,
+            y: (bottom - rule).max(top),
             w: table_w,
-            h: 1.0,
+            h: rule,
             color: self.theme.border,
         });
-        self.ops.push(Op::Fill {
-            x,
-            y: header_bottom,
-            w: table_w,
-            h: 1.0,
-            color: self.theme.border,
-        });
-        self.ops.push(Op::Fill {
-            x,
-            y: y0 + table_h,
-            w: table_w,
-            h: 1.0,
-            color: self.theme.border,
-        });
-        self.mark(x + table_w);
+        for (index, stop) in stops.iter().enumerate() {
+            let line_x = if index + 1 == stops.len() {
+                (stop - rule).max(origin)
+            } else {
+                *stop
+            };
+            chrome.push(Op::Fill {
+                x: line_x,
+                y: top,
+                w: rule,
+                h: (bottom - top).max(rule),
+                color: self.theme.border,
+            });
+        }
+        self.ops.splice(ops_before..ops_before, chrome);
+        self.mark(origin + table_w);
     }
 
-    fn paint_row(
-        &mut self,
-        cells: &[Vec<Inline>],
-        aligns: &[Align],
-        metrics: &RowMetrics,
-        header: bool,
-    ) {
-        let RowMetrics {
-            x,
-            col_w,
-            inner,
-            pad,
-        } = *metrics;
-        let y0 = self.y;
-        let mut row_h = self.line;
-        for (index, cell) in cells.iter().enumerate() {
-            let mut style = self.body_style();
-            if header {
-                style.weight = Weight::BOLD;
-            }
-            let align = aligns.get(index).copied().unwrap_or(Align::None);
-            let saved_y = self.y;
-            let (text_w, text_h) = self.measure_inlines(cell, inner, &style);
-            self.y = saved_y;
-            let shift = match align {
-                Align::Center => ((inner - text_w) / 2.0).max(0.0),
-                Align::Right => (inner - text_w).max(0.0),
-                Align::Left | Align::None => 0.0,
-            };
-            self.draw_inlines_at(cell, x + col_w * index as f32 + pad + shift, inner, style);
-            let height = (self.y - y0).max(text_h);
-            self.y = y0;
-            row_h = row_h.max(height + pad);
+    fn table_style(&self, header: bool) -> SpanStyle {
+        let mut style = self.body_style();
+        if header {
+            style.weight = Weight::BOLD;
+            style.color = self.theme.heading;
         }
-        self.y = y0 + row_h;
+        style
     }
 
     fn render_rule(&mut self, x: f32, width: f32) {
@@ -998,8 +1071,12 @@ impl<'a> Layouter<'a> {
             let target = image.link.clone().unwrap_or_else(|| image.dest.clone());
             match self.images.get(&image.dest, self.base_dir) {
                 Lookup::Ready(picture) => {
-                    let mut w = picture.width * self.zoom;
-                    let mut h = picture.height * self.zoom;
+                    let mut w = match image.width {
+                        Some(ImageWidth::Percent(percent)) => width * (percent / 100.0),
+                        Some(ImageWidth::Px(px)) => px * self.zoom,
+                        None => picture.width * self.zoom,
+                    };
+                    let mut h = picture.height * (w / picture.width.max(1.0));
                     if w > width {
                         h *= width / w;
                         w = width;
@@ -1021,8 +1098,11 @@ impl<'a> Layouter<'a> {
                     } else {
                         image.alt.clone()
                     };
-                    let (w, h) =
-                        self.measure_inlines(&[Inline::Text(label.clone())], width, &label_style);
+                    let (w, h) = self.measure_inlines(
+                        &[Inline::Text(label.clone())],
+                        Some(width),
+                        &label_style,
+                    );
                     items.push(RowItem {
                         w: w.min(width),
                         h,
@@ -1093,8 +1173,13 @@ impl<'a> Layouter<'a> {
     fn place_picture(&mut self, picture: &Picture, x: f32, y: f32, item: &RowItem) {
         let w = item.w.round().max(1.0) as u32;
         let h = item.h.round().max(1.0) as u32;
-        let resized =
-            image::imageops::resize(&picture.pixels, w, h, image::imageops::FilterType::Triangle);
+        // Screenshots are far larger than the column. The box filter in
+        // `thumbnail` downscales them much faster than a triangle filter.
+        let resized = if w < picture.pixels.width() && h < picture.pixels.height() {
+            image::imageops::thumbnail(&picture.pixels, w, h)
+        } else {
+            image::imageops::resize(&picture.pixels, w, h, image::imageops::FilterType::Triangle)
+        };
         self.ops.push(Op::Image {
             x,
             y,
@@ -1151,14 +1236,23 @@ impl<'a> Layouter<'a> {
         });
     }
 
-    fn measure_inlines(&mut self, inlines: &[Inline], width: f32, style: &SpanStyle) -> (f32, f32) {
+    fn measure_inlines(
+        &mut self,
+        inlines: &[Inline],
+        wrap: Option<f32>,
+        style: &SpanStyle,
+    ) -> (f32, f32) {
         let pieces = flatten(inlines, style, self.theme.link, self.theme.code_fg);
         if pieces.is_empty() {
             return (0.0, self.line);
         }
+        let wrap = wrap.map(|value| value.max(1.0));
+        if let Some((text_w, text_h)) = self.try_fast(&pieces, wrap, false, 0.0, 0.0, false) {
+            return (text_w, text_h);
+        }
         let metrics = Metrics::new(style.size.max(1.0), (style.size * 1.45).max(1.0));
         let mut buffer = Buffer::new(self.fonts, metrics);
-        buffer.set_size(self.fonts, Some(width.max(20.0)), None);
+        buffer.set_size(self.fonts, wrap, None);
         let built = build_pieces(&pieces, metrics);
         let pairs: Vec<(&str, Attrs)> = built
             .iter()
@@ -1175,6 +1269,73 @@ impl<'a> Layouter<'a> {
         (text_w, text_h.max(metrics.line_height))
     }
 
+    /// Places text without a shaper when every character is in the bundled faces.
+    /// `emit` records hit targets and paint ops; measuring passes `false`.
+    fn try_fast(
+        &mut self,
+        pieces: &[(String, SpanStyle)],
+        wrap: Option<f32>,
+        center: bool,
+        x: f32,
+        y: f32,
+        emit: bool,
+    ) -> Option<(f32, f32)> {
+        let specs: Vec<Spec<'_>> = pieces
+            .iter()
+            .map(|(text, style)| Spec {
+                text,
+                mono: style.mono,
+                bold: style.weight >= Weight::SEMIBOLD,
+                italic: matches!(style.font_style, FontStyle::Italic | FontStyle::Oblique),
+                size: style.size,
+                color: style.color,
+                link: style.link.as_deref(),
+                strike: style.strike,
+                code: style.code,
+            })
+            .collect();
+        let laid = self
+            .fast
+            .layout(&specs, LayoutOpts { wrap, center, x, y })?;
+        if emit {
+            for pill in laid.pills {
+                let pad = pill.h * 0.2;
+                let inset = pill.h * 0.1;
+                self.ops.push(Op::Round {
+                    x: pill.x - pad,
+                    y: pill.y + inset,
+                    w: pill.w + pad * 2.0,
+                    h: (pill.h - inset * 2.0).max(1.0),
+                    radius: pill.h * 0.22,
+                    color: self.theme.inline_bg,
+                });
+            }
+            for strike in laid.strikes {
+                self.ops.push(Op::Fill {
+                    x: strike.x,
+                    y: strike.y,
+                    w: strike.w,
+                    h: strike.h.max(1.0),
+                    color: self.theme.muted,
+                });
+            }
+            for (url, rect) in laid.links {
+                self.regions.push(Region {
+                    rect,
+                    kind: RegionKind::Link(url),
+                });
+            }
+            for (rect, text) in laid.atoms {
+                let line = self.line_seq;
+                self.line_seq += 1;
+                self.atoms.push(Atom { rect, text, line });
+            }
+            self.ops.push(Op::Glyphs(laid.inks));
+            self.mark(x + laid.width);
+        }
+        Some((laid.width, laid.height))
+    }
+
     fn layout_pieces(
         &mut self,
         pieces: &[(String, SpanStyle)],
@@ -1184,6 +1345,9 @@ impl<'a> Layouter<'a> {
     ) -> (f32, f32) {
         if pieces.is_empty() || pieces.iter().all(|(text, _)| text.is_empty()) {
             return (0.0, 0.0);
+        }
+        if let Some(size) = self.try_fast(pieces, wrap, self.center, x, y, true) {
+            return size;
         }
         let size = pieces.first().map_or(self.body, |(_, style)| style.size);
         let metrics = Metrics::new(size.max(1.0), (size * 1.45).max(1.0));
@@ -1195,7 +1359,12 @@ impl<'a> Layouter<'a> {
             .map(|piece| (piece.text.as_str(), piece.attrs.clone()))
             .collect();
         let default = Attrs::new().metrics(metrics);
-        buffer.set_rich_text(self.fonts, pairs, &default, Shaping::Advanced, None);
+        let shaping = if pieces.iter().all(|(_, style)| style.mono) {
+            Shaping::Basic
+        } else {
+            Shaping::Advanced
+        };
+        buffer.set_rich_text(self.fonts, pairs, &default, shaping, None);
         if self.center {
             for line in &mut buffer.lines {
                 line.set_align(Some(TextAlign::Center));
@@ -1351,6 +1520,7 @@ impl<'a> Layouter<'a> {
                     );
                 }
                 Op::Text(text) => self.paint_text(&mut pixmap, text),
+                Op::Glyphs(inks) => paint_glyphs(&mut pixmap, self.fast, &inks),
             }
         }
         Page {
@@ -1548,7 +1718,7 @@ fn flatten_into(
                 next.color = link_color;
                 flatten_into(children, &next, link_color, code_color, out);
             }
-            Inline::Image { alt, dest } => {
+            Inline::Image { alt, dest, .. } => {
                 let mut next = style.clone_style();
                 next.link = Some(dest.clone());
                 next.color = link_color;
@@ -1970,6 +2140,61 @@ fn hue_distance(a: f32, b: f32) -> f32 {
     distance.min(360.0 - distance)
 }
 
+fn table_header_bg(theme: &Theme) -> Rgba {
+    mix(theme.bg, theme.fg, 0.08)
+}
+
+fn table_stripe(theme: &Theme) -> Rgba {
+    mix(theme.bg, theme.fg, 0.045)
+}
+
+/// Fit columns to their text. A short column keeps its natural width; only the
+/// widest columns shrink, and never below the longest word.
+fn column_widths(min: &[f32], max: &[f32], available: f32) -> Vec<f32> {
+    let mut widths = max.to_vec();
+    loop {
+        let sum: f32 = widths.iter().sum();
+        if sum <= available + 0.5 {
+            return widths;
+        }
+        let Some(index) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width > min[*index] + 0.5)
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index)
+        else {
+            return widths;
+        };
+        let room = widths[index] - min[index];
+        widths[index] -= (sum - available).min(room);
+    }
+}
+
+fn longest_word(inlines: &[Inline]) -> String {
+    let mut best = String::new();
+    fn walk(inlines: &[Inline], best: &mut String) {
+        for inline in inlines {
+            match inline {
+                Inline::Text(text) | Inline::Code(text) | Inline::Image { alt: text, .. } => {
+                    for word in text.split_whitespace() {
+                        if word.chars().count() > best.chars().count() {
+                            *best = word.to_owned();
+                        }
+                    }
+                }
+                Inline::Strong(inner) | Inline::Emphasis(inner) | Inline::Strike(inner) => {
+                    walk(inner, best);
+                }
+                Inline::Link { children, .. } => walk(children, best),
+                Inline::SoftBreak | Inline::HardBreak => {}
+            }
+        }
+    }
+    walk(inlines, &mut best);
+    best
+}
+
 fn mix(from: Rgba, to: Rgba, amount: f32) -> Rgba {
     let channel =
         |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
@@ -1996,6 +2221,29 @@ fn alert_color(kind: AlertKind) -> Rgba {
         AlertKind::Important => [163, 113, 247, 255],
         AlertKind::Warning => [210, 153, 34, 255],
         AlertKind::Caution => [248, 81, 73, 255],
+    }
+}
+
+fn paint_glyphs(pixmap: &mut Pixmap, fast: &FastText, inks: &[crate::fasttext::Ink]) {
+    for ink in inks {
+        let Some((width, height, coverage)) = fast.mask(ink.key) else {
+            continue;
+        };
+        for row in 0..height {
+            let row_start = (row * width) as usize;
+            for col in 0..width {
+                let alpha = coverage[row_start + col as usize];
+                if alpha < 8 {
+                    continue;
+                }
+                blend(
+                    pixmap,
+                    ink.x + col as i32,
+                    ink.y + row as i32,
+                    [ink.color[0], ink.color[1], ink.color[2], alpha],
+                );
+            }
+        }
     }
 }
 
@@ -2130,6 +2378,21 @@ mod tests {
     }
 
     #[test]
+    fn a_full_width_image_uses_the_column_not_its_pixels() {
+        let doc = parse(
+            "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\" width=\"100%\" alt=\"shot\">\n",
+        );
+        let mut renderer = Renderer::new();
+        let page = renderer.render(&doc, 900.0, &Theme::dark(), 1.0, 16.0, Path::new("."));
+        let region = page
+            .regions
+            .iter()
+            .find(|region| matches!(region.kind, RegionKind::Link(_)))
+            .expect("image");
+        assert!(region.rect.w > 400.0, "column width, got {}", region.rect.w);
+    }
+
+    #[test]
     fn a_centred_title_keeps_the_rule_under_it() {
         let doc = parse("<div align=\"center\">\n\n<h1>md</h1>\n\n<p>Subtitle</p>\n\n</div>\n");
         let theme = Theme::dark();
@@ -2159,6 +2422,18 @@ mod tests {
             hits > 40,
             "rule under the title, hits {hits} between {y0} and {y1}"
         );
+        let ink = ((title.rect.y as u32)..(title.rect.y + title.rect.h) as u32)
+            .map(|y| {
+                (title.rect.x as u32..(title.rect.x + title.rect.w) as u32)
+                    .filter(|x| {
+                        page.pixmap.pixel(*x, y).is_some_and(|pixel| {
+                            pixel.red() != theme.bg[0] || pixel.green() != theme.bg[1]
+                        })
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(ink > 20, "glyphs in the title line, got {ink}");
     }
 
     #[test]
@@ -2271,5 +2546,64 @@ mod tests {
         let heading = crate::page::tightest_frame(&page.frames, 1).unwrap();
         assert!(changed.rect.y > heading.rect.y);
         assert!(changed.rect.h > 1.0);
+    }
+
+    #[test]
+    fn a_code_block_keeps_a_blank_line() {
+        let doc = parse("```\nalpha\n\nbeta\n```\n");
+        let mut renderer = Renderer::new();
+        let page = renderer.render(&doc, 800.0, &Theme::dark(), 1.0, 16.0, Path::new("."));
+        let alpha = page.atoms.iter().find(|atom| atom.text == "alpha").unwrap();
+        let beta = page.atoms.iter().find(|atom| atom.text == "beta").unwrap();
+        assert!(beta.rect.y > alpha.rect.y + alpha.rect.h);
+    }
+
+    #[test]
+    fn a_table_gives_the_short_column_less_room_and_rules_the_rows() {
+        let doc = parse(
+            "| Go | This explanation is long enough that it has to wrap inside the second column |\n| -- | -- |\n| ok | more words about the second column so the row is taller than the command |\n",
+        );
+        let theme = Theme::dark();
+        let mut renderer = Renderer::new();
+        let page = renderer.render(&doc, 900.0, &theme, 1.0, 16.0, Path::new("."));
+        let go = page.atoms.iter().find(|atom| atom.text == "Go").unwrap();
+        let explanation = page
+            .atoms
+            .iter()
+            .find(|atom| atom.text.starts_with("This"))
+            .unwrap();
+        assert!(
+            explanation.rect.x > go.rect.x + go.rect.w,
+            "columns overlap"
+        );
+        assert!(
+            explanation.rect.x < go.rect.x + 180.0,
+            "short column took half the table: explanation at {}",
+            explanation.rect.x - go.rect.x
+        );
+        let sample = page
+            .pixmap
+            .pixel((go.rect.x - 4.0) as u32, (go.rect.y + 2.0) as u32)
+            .unwrap();
+        let header = table_header_bg(&theme);
+        assert_eq!(
+            [sample.red(), sample.green(), sample.blue()],
+            [header[0], header[1], header[2]]
+        );
+        let ok = page.atoms.iter().find(|atom| atom.text == "ok").unwrap();
+        assert!(ok.rect.y > go.rect.y + go.rect.h);
+        let hits = (go.rect.y as u32..ok.rect.y as u32)
+            .map(|y| {
+                (0..page.pixmap.width())
+                    .filter(|x| {
+                        page.pixmap.pixel(*x, y).is_some_and(|pixel| {
+                            pixel.red() == theme.border[0] && pixel.green() == theme.border[1]
+                        })
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(hits > 40, "row rule, hits {hits}");
     }
 }

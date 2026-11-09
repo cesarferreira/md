@@ -1,5 +1,6 @@
 mod change;
 mod document;
+mod fasttext;
 mod images;
 mod nav;
 mod page;

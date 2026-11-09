@@ -32,6 +32,11 @@ pub enum Lookup {
     Missing,
 }
 
+struct LocalPicture {
+    modified: Option<SystemTime>,
+    picture: Arc<Picture>,
+}
+
 enum Entry {
     Pending,
     Ready(Arc<Picture>),
@@ -43,6 +48,8 @@ pub struct ImageStore {
     remote: Arc<Mutex<HashMap<String, Entry>>>,
     updated: Arc<AtomicBool>,
     cache_dir: Arc<PathBuf>,
+    /// Decoded local files, so a resize does not read the PNG again.
+    local: Arc<Mutex<HashMap<PathBuf, LocalPicture>>>,
 }
 
 impl Default for ImageStore {
@@ -51,6 +58,7 @@ impl Default for ImageStore {
             remote: Arc::new(Mutex::new(HashMap::new())),
             updated: Arc::new(AtomicBool::new(false)),
             cache_dir: Arc::new(default_cache_dir()),
+            local: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -71,9 +79,39 @@ impl ImageStore {
             } else {
                 base_dir.join(path)
             };
-            fs::read(path).ok().and_then(|bytes| decode(&bytes))
+            return self.local_file(path);
         };
         picture.map_or(Lookup::Missing, |picture| Lookup::Ready(Arc::new(picture)))
+    }
+
+    fn local_file(&self, path: PathBuf) -> Lookup {
+        let modified = fs::metadata(&path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        if let Some(picture) = self.cached_local(&path, modified) {
+            return Lookup::Ready(picture);
+        }
+        let Some(picture) = fs::read(&path).ok().and_then(|bytes| decode(&bytes)) else {
+            return Lookup::Missing;
+        };
+        let picture = Arc::new(picture);
+        self.local
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                path,
+                LocalPicture {
+                    modified,
+                    picture: Arc::clone(&picture),
+                },
+            );
+        Lookup::Ready(picture)
+    }
+
+    fn cached_local(&self, path: &Path, modified: Option<SystemTime>) -> Option<Arc<Picture>> {
+        let cache = self.local.lock().unwrap_or_else(|err| err.into_inner());
+        let hit = cache.get(path)?;
+        (hit.modified == modified).then(|| Arc::clone(&hit.picture))
     }
 
     /// True once since the last call if a remote image finished loading.
@@ -372,6 +410,7 @@ mod tests {
             remote: Arc::new(Mutex::new(HashMap::new())),
             updated: Arc::new(AtomicBool::new(false)),
             cache_dir: Arc::new(dir.clone()),
+            local: Arc::new(Mutex::new(HashMap::new())),
         };
         let lookup = store.get(url, Path::new("."));
         assert!(matches!(lookup, Lookup::Ready(picture) if picture.width == 80.0));

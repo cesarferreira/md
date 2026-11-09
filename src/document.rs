@@ -69,6 +69,15 @@ pub struct ImageRef {
     pub dest: String,
     /// Where a click goes when the image is wrapped in a link.
     pub link: Option<String>,
+    /// `width` from the HTML tag, when the author set one.
+    pub width: Option<ImageWidth>,
+}
+
+/// An image's HTML `width`: a percentage of the column, or a CSS pixel size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImageWidth {
+    Px(f32),
+    Percent(f32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,8 +124,15 @@ pub enum Inline {
     Strong(Vec<Inline>),
     Emphasis(Vec<Inline>),
     Strike(Vec<Inline>),
-    Link { dest: String, children: Vec<Inline> },
-    Image { alt: String, dest: String },
+    Link {
+        dest: String,
+        children: Vec<Inline>,
+    },
+    Image {
+        alt: String,
+        dest: String,
+        width: Option<ImageWidth>,
+    },
 }
 
 pub fn parse(markdown: &str) -> Document {
@@ -511,23 +527,26 @@ fn image_row(inlines: &[Inline]) -> Option<Vec<ImageRef>> {
     for inline in inlines {
         match inline {
             inline if is_blank(inline) => {}
-            Inline::Image { alt, dest } => images.push(ImageRef {
+            Inline::Image { alt, dest, width } => images.push(ImageRef {
                 alt: alt.clone(),
                 dest: dest.clone(),
                 link: None,
+                width: *width,
             }),
             Inline::Link {
                 dest: link,
                 children,
             } => {
                 let mut parts = children.iter().filter(|child| !is_blank(child));
-                let (Some(Inline::Image { alt, dest }), None) = (parts.next(), parts.next()) else {
+                let (Some(Inline::Image { alt, dest, width }), None) = (parts.next(), parts.next())
+                else {
                     return None;
                 };
                 images.push(ImageRef {
                     alt: alt.clone(),
                     dest: dest.clone(),
                     link: Some(link.clone()),
+                    width: *width,
                 });
             }
             _ => return None,
@@ -621,6 +640,7 @@ fn inline_of<'a>(node: &'a AstNode<'a>) -> Option<Inline> {
         OwnedInline::Image(dest) => Some(Inline::Image {
             alt: plain(&inlines_of(node)),
             dest,
+            width: None,
         }),
         OwnedInline::Emphasis => Some(Inline::Emphasis(inlines_of(node))),
         OwnedInline::Strong => Some(Inline::Strong(inlines_of(node))),
@@ -703,6 +723,7 @@ impl HtmlScan {
                     let image = Inline::Image {
                         alt: attr_value(attrs, "alt").unwrap_or_default(),
                         dest,
+                        width: image_width(attrs),
                     };
                     self.para.push(match &self.link {
                         Some(link) => Inline::Link {
@@ -830,6 +851,20 @@ fn attr_value(attrs: &str, name: &str) -> Option<String> {
         _ => rest.split_whitespace().next()?,
     };
     Some(value.to_owned())
+}
+
+fn image_width(attrs: &str) -> Option<ImageWidth> {
+    let value = attr_value(attrs, "width")?;
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent.trim().parse().ok().map(ImageWidth::Percent);
+    }
+    value
+        .trim_end_matches("px")
+        .trim()
+        .parse()
+        .ok()
+        .map(ImageWidth::Px)
 }
 
 fn styled_text(
@@ -986,6 +1021,26 @@ fn main() {}
     #[test]
     fn slug_is_lowercase_and_hyphenated() {
         assert_eq!(slug("Hello, World!"), "hello-world");
+    }
+
+    #[test]
+    fn html_image_width_is_kept() {
+        let doc = parse(
+            "<img src=\"a.png\" width=\"100%\" alt=\"wide\">\n\n<img src=\"b.png\" width=\"760\">\n",
+        );
+        let mut widths = Vec::new();
+        for section in &doc.blocks {
+            if let Block::Images(images) = &section.block {
+                widths.extend(images.iter().map(|image| image.width));
+            }
+        }
+        assert_eq!(
+            widths,
+            vec![
+                Some(ImageWidth::Percent(100.0)),
+                Some(ImageWidth::Px(760.0))
+            ]
+        );
     }
 
     #[test]
