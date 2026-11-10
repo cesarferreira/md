@@ -87,6 +87,8 @@ impl Drop for ScreenGuard {
         ] {
             let _ = write!(out, "{}", delete_image(id));
         }
+        // Page tiles have ids this guard does not track. Free everything.
+        let _ = write!(out, "\x1b_Ga=d,d=A,q=2\x1b\\");
         let _ = write!(out, "\x1b[0m");
         let _ = execute!(out, Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();

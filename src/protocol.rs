@@ -75,6 +75,11 @@ pub fn place_image(id: u32, placement: u32, source: SourceRect, cols: u32, rows:
     )
 }
 
+/// Remove every placement of an image but keep its data, so it can be placed again.
+pub fn delete_placements(id: u32) -> String {
+    command(&format!("a=d,d=i,i={id},q=2"), "")
+}
+
 /// Delete one image and its stored data.
 pub fn delete_image(id: u32) -> String {
     command(&format!("a=d,d=I,i={id},q=2"), "")

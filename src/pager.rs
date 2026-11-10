@@ -1,7 +1,9 @@
 //! Full-screen pager. Scroll, select, follow links, reload.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,12 +25,19 @@ use crate::nav::{Nav, resolve_link};
 use crate::page::{
     Rect, anchor_y, change_scroll_y, frame_for_change, hit_link, hit_toggle, selected_text,
 };
-use crate::protocol::{SourceRect, delete_image, place_image, transmit_png};
+use crate::protocol::{
+    SourceRect, delete_image, delete_placements, place_image, transmit_png,
+};
 use crate::render::{Renderer, StatusBar, Theme, ThemeChoice, crop_pixmap, fill_rect};
 use crate::terminal::{self as term, DisplayInfo, ScreenGuard};
 
-/// Kitty image ids for the footer. The page uses 1 and 2.
+/// Kitty image ids for the footer. The selection view uses 1 and 2.
 pub const STATUS_IDS: [u32; 2] = [3, 4];
+/// First image id used for page tiles. Lower ids belong to the views above.
+const TILE_ID_BASE: u32 = 100;
+/// Target tile height in pixels, rounded down to whole cell rows. A tile is the
+/// unit sent to the terminal, so a scroll uploads one tile, not the whole page.
+const TILE_TARGET_PX: u32 = 768;
 const STATUS_HINTS: &str = "j/k scroll   r reload   q quit   ? help";
 
 const HELP: &[&str] = &[
@@ -132,12 +141,15 @@ struct App {
     stamp: Option<FileStamp>,
     watch: Option<Watch>,
     mark_line: Option<u32>,
-    shown: Option<Shown>,
+    tiles: Tiles,
     image_dirty: bool,
     /// Column count the current page was laid out for.
     rendered_cols: u16,
     /// Set while the window is changing, so the reflow waits until it settles.
     resize_at: Option<Instant>,
+    /// While set, `present` only records that a redraw is due.
+    defer_present: bool,
+    present_due: bool,
 }
 
 impl App {
@@ -174,10 +186,12 @@ impl App {
             stamp: None,
             watch: None,
             mark_line: None,
-            shown: None,
+            tiles: Tiles::default(),
             image_dirty: true,
             rendered_cols: cols,
             resize_at: None,
+            defer_present: false,
+            present_due: false,
         };
         app.note_stamp();
         app.rewatch();
@@ -197,19 +211,44 @@ impl App {
             }
             // Poll quickly while badges are in flight so they appear with the page
             // instead of on the next keypress.
+            let prefetching = self.next_prefetch().is_some();
             let wait = if self.resize_at.is_some() {
                 Duration::from_millis(80)
             } else if self.renderer.images_pending() {
                 Duration::from_millis(20)
+            } else if prefetching {
+                Duration::from_millis(2)
             } else {
                 Duration::from_millis(150)
             };
             if !event::poll(wait)? {
                 if self.resize_at.is_some() {
                     self.settle_resize()?;
+                } else if prefetching {
+                    self.prefetch()?;
                 }
                 continue;
             }
+            // A trackpad flick queues dozens of events. Apply them all and draw
+            // once, or the terminal falls behind on image uploads.
+            self.defer_present = true;
+            let quit = self.handle_queued();
+            self.defer_present = false;
+            let quit = quit?;
+            if std::mem::take(&mut self.present_due) {
+                self.present()?;
+            }
+            if quit {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle the next event and every event already queued behind it.
+    /// Returns true when the user asked to quit.
+    fn handle_queued(&mut self) -> Result<bool> {
+        loop {
             match event::read()? {
                 Event::Resize(cols, rows) => self.note_resize(cols, rows)?,
                 other => {
@@ -219,7 +258,7 @@ impl App {
                     match other {
                         Event::Key(key) if key.kind != KeyEventKind::Release => {
                             if self.on_key(key)? {
-                                break;
+                                return Ok(true);
                             }
                         }
                         Event::Mouse(mouse) => self.on_mouse(mouse)?,
@@ -227,8 +266,10 @@ impl App {
                     }
                 }
             }
+            if !event::poll(Duration::ZERO)? {
+                return Ok(false);
+            }
         }
-        Ok(())
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -556,98 +597,239 @@ impl App {
         self.present()
     }
 
-    /// Move the image already on screen to the new window, without encoding pixels.
+    /// Move the tiles already on screen to the new window, without encoding pixels.
     fn restretch(&mut self) -> io::Result<()> {
         if self.help {
             return Ok(());
         }
         let theme = Theme::choose(self.theme, self.background, &self.palette);
-        let (image_cols, image_rows, view_w, view_h) = self.grid();
         let mut out = io::stdout().lock();
-        execute!(out, MoveTo(0, 0))?;
-        if let Some(shown) = self.shown {
-            // Keep the pixels at 1:1. Filling the new cell grid would squash the
-            // page for the whole drag and snap it back when the reflow lands.
-            let (x, y, w, h) = shown.source(px(self.scroll_x), px(self.scroll_y), view_w, view_h);
-            let cols = cells_for(w, self.cell_w, image_cols);
-            let rows = cells_for(h, self.cell_h, image_rows);
-            write!(
-                out,
-                "{}",
-                place_image(shown.id, 1, SourceRect { x, y, w, h }, cols, rows)
-            )?;
+        if self.selection.is_none() {
+            self.place_tiles(&mut out)?;
         }
         self.write_status(&mut out, &theme)?;
         Ok(())
     }
 
     fn present(&mut self) -> io::Result<()> {
+        if self.defer_present {
+            self.present_due = true;
+            return Ok(());
+        }
+        self.present_now()
+    }
+
+    fn present_now(&mut self) -> io::Result<()> {
         if self.help {
             return self.present_help();
         }
         let theme = Theme::choose(self.theme, self.background, &self.palette);
-        let (image_cols, image_rows, view_w, view_h) = self.grid();
-        let scroll_x = px(self.scroll_x);
-        let scroll_y = px(self.scroll_y);
         let mut out = io::stdout().lock();
-        // Placements are anchored at the cursor. Leave it at the top-left or
-        // the page draws shifted and the right edge is clipped.
-        execute!(out, MoveTo(0, 0))?;
-        let can_pan = self.selection.is_none() && !self.image_dirty;
-        let shown = self
-            .shown
-            .filter(|shown| can_pan && shown.covers(scroll_x, scroll_y, view_w, view_h));
-        if let Some(shown) = shown {
-            let (x, y, w, h) = shown.source(scroll_x, scroll_y, view_w, view_h);
-            write!(
-                out,
-                "{}",
-                place_image(
-                    shown.id,
-                    1,
-                    SourceRect { x, y, w, h },
-                    u32::from(image_cols),
-                    u32::from(image_rows)
-                )
-            )?;
+        if self.selection.is_some() {
+            self.hide_tiles(&mut out)?;
+            self.present_selection(&mut out, &theme)?;
         } else {
-            self.transmit(&mut out, &theme, image_cols, image_rows, view_w, view_h)?;
+            if self.slot != 0 {
+                write!(out, "{}", delete_image(self.slot))?;
+                self.slot = 0;
+            }
+            if self.image_dirty {
+                self.purge_tiles(&mut out)?;
+                self.image_dirty = false;
+            }
+            let (_, _, _, view_h) = self.grid();
+            let (tile_px, _, count) = self.page_metrics();
+            let scroll_y = px(self.scroll_y);
+            for index in visible_tiles(scroll_y, view_h, tile_px, count) {
+                if !self.tiles.cache.contains_key(&index) {
+                    self.upload_tile(&mut out, &theme, index)?;
+                }
+            }
+            self.place_tiles(&mut out)?;
+            self.evict_tiles(&mut out)?;
         }
         self.write_status(&mut out, &theme)?;
         Ok(())
     }
 
-    /// Send the page pixels once. Later scrolls only move the source rectangle.
-    fn transmit<W: Write>(
-        &mut self,
-        out: &mut W,
-        theme: &Theme,
-        cols: u16,
-        rows: u16,
-        view_w: u32,
-        view_h: u32,
-    ) -> io::Result<()> {
+    /// Page height in pixels rounded up to whole cell rows. The page ends on a
+    /// cell edge so the last tile and the last scroll position line up.
+    fn page_metrics(&self) -> (u32, u32, u32) {
+        let cell = self.cell_h.max(1);
+        let (_, _, _, view_h) = self.grid();
+        let tile_px = tile_rows(cell) * cell;
+        let padded = padded_height(self.page.height(), view_h, cell);
+        (tile_px, padded, padded.div_ceil(tile_px))
+    }
+
+    /// Encode one tile of the page and send it to the terminal, without placing it.
+    fn upload_tile<W: Write>(&mut self, out: &mut W, theme: &Theme, index: u32) -> io::Result<()> {
+        let (_, _, view_w, _) = self.grid();
+        let (tile_px, padded, _) = self.page_metrics();
+        let (y, h) = tile_span(index, tile_px, padded);
+        let width = self.page.width().max(view_w);
+        let mut image = crop_pixmap(&self.page.pixmap, 0, y, width, h, theme.bg);
+        self.paint_mark(&mut image, theme, 0.0, y as f32);
+        let png = image
+            .encode_png()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let id = TILE_ID_BASE + self.tiles.next_id;
+        self.tiles.next_id += 1;
+        write!(out, "{}", transmit_png(id, &png))?;
+        self.tiles.tick += 1;
+        self.tiles.cache.insert(
+            index,
+            Tile {
+                id,
+                width,
+                used: self.tiles.tick,
+            },
+        );
+        Ok(())
+    }
+
+    /// Place every visible tile that has been uploaded and lift the placements
+    /// of tiles that scrolled away. The image data stays in the terminal.
+    fn place_tiles<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        let (cols, rows, view_w, view_h) = self.grid();
+        let (tile_px, padded, count) = self.page_metrics();
+        let cell_h = self.cell_h.max(1);
         let scroll_x = px(self.scroll_x);
         let scroll_y = px(self.scroll_y);
-        let selecting = self.selection.is_some();
-        let (mut image, origin_x, origin_y) = if selecting {
-            let crop = crop_pixmap(
-                &self.page.pixmap,
-                scroll_x,
-                scroll_y,
-                view_w,
-                view_h,
-                theme.bg,
-            );
-            (crop, scroll_x, scroll_y)
-        } else {
-            let page_w = self.page.width().max(view_w);
-            let page_h = self.page.height().max(view_h);
-            let (origin_y, strip_h) = strip_window(scroll_y, view_h, page_h);
-            let strip = crop_pixmap(&self.page.pixmap, 0, origin_y, page_w, strip_h, theme.bg);
-            (strip, 0, origin_y)
+        let mut now = HashSet::new();
+        for index in visible_tiles(scroll_y, view_h, tile_px, count) {
+            let Some(tile) = self.tiles.cache.get_mut(&index) else {
+                continue;
+            };
+            let (_, tile_h) = tile_span(index, tile_px, padded);
+            let Some(spot) = place_tile(index, scroll_y, view_h, tile_px, tile_h) else {
+                continue;
+            };
+            self.tiles.tick += 1;
+            tile.used = self.tiles.tick;
+            let x = scroll_x.min(tile.width.saturating_sub(1));
+            let w = view_w.min(tile.width - x).max(1);
+            execute!(out, MoveTo(0, (spot.top / cell_h) as u16))?;
+            write!(
+                out,
+                "{}",
+                place_image(
+                    tile.id,
+                    1,
+                    SourceRect {
+                        x,
+                        y: spot.src_y,
+                        w,
+                        h: spot.height,
+                    },
+                    cells_for(w, self.cell_w, cols),
+                    cells_for(spot.height, cell_h, rows)
+                )
+            )?;
+            now.insert(index);
+        }
+        for index in self.tiles.placed.difference(&now) {
+            if let Some(tile) = self.tiles.cache.get(index) {
+                write!(out, "{}", delete_placements(tile.id))?;
+            }
+        }
+        self.tiles.placed = now;
+        Ok(())
+    }
+
+    /// Lift every tile placement, keeping the uploaded data for later.
+    fn hide_tiles<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        for index in std::mem::take(&mut self.tiles.placed) {
+            if let Some(tile) = self.tiles.cache.get(&index) {
+                write!(out, "{}", delete_placements(tile.id))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Free every tile in the terminal. Used when the page pixels change.
+    fn purge_tiles<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        for tile in self.tiles.cache.values() {
+            write!(out, "{}", delete_image(tile.id))?;
+        }
+        self.tiles.cache.clear();
+        self.tiles.placed.clear();
+        Ok(())
+    }
+
+    /// Tiles worth holding: the view plus some room ahead and behind.
+    fn keep_range(&self) -> Range<u32> {
+        let (_, _, _, view_h) = self.grid();
+        let (tile_px, _, count) = self.page_metrics();
+        keep_tiles(px(self.scroll_y), view_h, tile_px, count)
+    }
+
+    /// Free the tiles farthest from the view once the cache is over its budget.
+    fn evict_tiles<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        let keep = self.keep_range();
+        let limit = keep.len() + 2;
+        if self.tiles.cache.len() <= limit {
+            return Ok(());
+        }
+        let (tile_px, _, _) = self.page_metrics();
+        let center = px(self.scroll_y) / tile_px.max(1);
+        let mut far: Vec<u32> = self
+            .tiles
+            .cache
+            .keys()
+            .copied()
+            .filter(|index| !keep.contains(index))
+            .collect();
+        far.sort_by_key(|index| std::cmp::Reverse(index.abs_diff(center)));
+        let excess = self.tiles.cache.len() - limit;
+        for index in far.into_iter().take(excess) {
+            if let Some(tile) = self.tiles.cache.remove(&index) {
+                write!(out, "{}", delete_image(tile.id))?;
+            }
+            self.tiles.placed.remove(&index);
+        }
+        Ok(())
+    }
+
+    /// The nearest tile in the keep range that the terminal does not have yet.
+    fn next_prefetch(&self) -> Option<u32> {
+        if self.help || self.selection.is_some() || self.image_dirty {
+            return None;
+        }
+        let (tile_px, _, _) = self.page_metrics();
+        let center = px(self.scroll_y) / tile_px.max(1);
+        self.keep_range()
+            .filter(|index| !self.tiles.cache.contains_key(index))
+            .min_by_key(|index| index.abs_diff(center))
+    }
+
+    /// Upload one tile ahead of the scroll while the user is idle.
+    fn prefetch(&mut self) -> io::Result<()> {
+        let Some(index) = self.next_prefetch() else {
+            return Ok(());
         };
-        self.paint_mark(&mut image, theme, origin_x as f32, origin_y as f32);
+        let theme = Theme::choose(self.theme, self.background, &self.palette);
+        let mut out = io::stdout().lock();
+        self.upload_tile(&mut out, &theme, index)?;
+        out.flush()
+    }
+
+    /// While text is selected the highlight is painted into one picture of the
+    /// view, so the tiles are lifted and this picture replaces them.
+    fn present_selection<W: Write>(&mut self, out: &mut W, theme: &Theme) -> io::Result<()> {
+        let (cols, rows, view_w, view_h) = self.grid();
+        let scroll_x = px(self.scroll_x);
+        let scroll_y = px(self.scroll_y);
+        execute!(out, MoveTo(0, 0))?;
+        let mut image = crop_pixmap(
+            &self.page.pixmap,
+            scroll_x,
+            scroll_y,
+            view_w,
+            view_h,
+            theme.bg,
+        );
+        self.paint_mark(&mut image, theme, scroll_x as f32, scroll_y as f32);
         if let Some(selection) = &self.selection {
             for atom in &self.page.atoms {
                 if !atom.rect.intersects(selection.rect()) {
@@ -655,8 +837,8 @@ impl App {
                 }
                 fill_rect(
                     &mut image,
-                    atom.rect.x - origin_x as f32,
-                    atom.rect.y - origin_y as f32,
+                    atom.rect.x - scroll_x as f32,
+                    atom.rect.y - scroll_y as f32,
                     atom.rect.w,
                     atom.rect.h,
                     theme.selection,
@@ -667,14 +849,6 @@ impl App {
             .encode_png()
             .map_err(|err| io::Error::other(err.to_string()))?;
         let next = if self.slot == 1 { 2 } else { 1 };
-        let source_x = scroll_x
-            .saturating_sub(origin_x)
-            .min(image.width().saturating_sub(1));
-        let source_y = scroll_y
-            .saturating_sub(origin_y)
-            .min(image.height().saturating_sub(1));
-        let source_w = view_w.min(image.width() - source_x).max(1);
-        let source_h = view_h.min(image.height() - source_y).max(1);
         write!(out, "{}", transmit_png(next, &png))?;
         write!(
             out,
@@ -683,10 +857,10 @@ impl App {
                 next,
                 1,
                 SourceRect {
-                    x: source_x,
-                    y: source_y,
-                    w: source_w,
-                    h: source_h,
+                    x: 0,
+                    y: 0,
+                    w: image.width(),
+                    h: image.height(),
                 },
                 u32::from(cols),
                 u32::from(rows)
@@ -696,18 +870,6 @@ impl App {
             write!(out, "{}", delete_image(self.slot))?;
         }
         self.slot = next;
-        if selecting {
-            self.shown = None;
-            self.image_dirty = true;
-        } else {
-            self.shown = Some(Shown {
-                id: next,
-                origin_y,
-                width: image.width(),
-                height: image.height(),
-            });
-            self.image_dirty = false;
-        }
         Ok(())
     }
 
@@ -744,11 +906,11 @@ impl App {
     }
 
     fn present_help(&mut self) -> io::Result<()> {
-        self.shown = None;
         self.image_dirty = true;
         self.slot = 0;
         self.status_slot = 0;
         let mut out = io::stdout().lock();
+        self.purge_tiles(&mut out)?;
         for id in [1, 2, STATUS_IDS[0], STATUS_IDS[1]] {
             write!(out, "{}", delete_image(id))?;
         }
@@ -861,7 +1023,8 @@ impl App {
     }
 
     fn max_scroll_y(&self) -> f32 {
-        (self.page.height() as f32 - self.view_height()).max(0.0)
+        let (_, padded, _) = self.page_metrics();
+        padded.saturating_sub(self.grid().3) as f32
     }
 
     fn max_scroll_x(&self) -> f32 {
@@ -870,7 +1033,7 @@ impl App {
 
     fn clamp(&mut self) {
         self.scroll_x = self.scroll_x.clamp(0.0, self.max_scroll_x());
-        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll_y());
+        self.scroll_y = snap_scroll(self.scroll_y, self.cell_h as f32, self.max_scroll_y());
     }
 
     fn scroll_ratio(&self) -> f32 {
@@ -975,36 +1138,83 @@ fn home_relative(dir: &Path) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Shown {
+struct Tile {
     id: u32,
-    origin_y: u32,
     width: u32,
+    used: u64,
+}
+
+/// Page tiles the terminal holds, by tile index.
+#[derive(Default)]
+struct Tiles {
+    cache: HashMap<u32, Tile>,
+    /// Tiles with a live placement on screen.
+    placed: HashSet<u32>,
+    next_id: u32,
+    tick: u64,
+}
+
+/// Cell rows in one tile, so every tile edge lands on a cell boundary.
+fn tile_rows(cell_h: u32) -> u32 {
+    (TILE_TARGET_PX / cell_h.max(1)).max(1)
+}
+
+/// Page height rounded up to whole cells, and never shorter than the view.
+fn padded_height(page_h: u32, view_h: u32, cell_h: u32) -> u32 {
+    (page_h.div_ceil(cell_h.max(1)) * cell_h.max(1)).max(view_h)
+}
+
+/// First pixel row and height of a tile. The last tile may be shorter.
+fn tile_span(index: u32, tile_px: u32, padded: u32) -> (u32, u32) {
+    let top = index * tile_px;
+    (top, tile_px.min(padded.saturating_sub(top)))
+}
+
+/// Tiles that overlap the view.
+fn visible_tiles(scroll: u32, view_h: u32, tile_px: u32, count: u32) -> Range<u32> {
+    let tile_px = tile_px.max(1);
+    let first = (scroll / tile_px).min(count);
+    let last = ((scroll + view_h).saturating_sub(1) / tile_px + 1).min(count);
+    first..last.max(first)
+}
+
+/// Tiles worth keeping: the view, three quarters of a view behind, and a view
+/// and three quarters ahead. Reading goes down, so more room lies that way.
+fn keep_tiles(scroll: u32, view_h: u32, tile_px: u32, count: u32) -> Range<u32> {
+    let tile_px = tile_px.max(1);
+    let lo = scroll.saturating_sub(view_h * 3 / 4);
+    let hi = scroll + view_h * 7 / 4;
+    let first = (lo / tile_px).min(count);
+    let last = (hi.saturating_sub(1) / tile_px + 1).min(count);
+    first..last.max(first)
+}
+
+/// Where the visible part of a tile goes: pixel rows below the top of the view,
+/// the first source row inside the tile, and the visible height.
+#[derive(Debug, PartialEq, Eq)]
+struct Spot {
+    top: u32,
+    src_y: u32,
     height: u32,
 }
 
-impl Shown {
-    fn covers(self, scroll_x: u32, scroll_y: u32, view_w: u32, view_h: u32) -> bool {
-        scroll_x.saturating_add(view_w) <= self.width
-            && scroll_y >= self.origin_y
-            && scroll_y.saturating_add(view_h) <= self.origin_y.saturating_add(self.height)
-    }
+fn place_tile(index: u32, scroll: u32, view_h: u32, tile_px: u32, tile_h: u32) -> Option<Spot> {
+    let tile_top = index * tile_px;
+    let top = tile_top.max(scroll);
+    let bottom = (tile_top + tile_h).min(scroll + view_h);
+    (bottom > top).then_some(Spot {
+        top: top - scroll,
+        src_y: top - tile_top,
+        height: bottom - top,
+    })
+}
 
-    fn source(
-        self,
-        scroll_x: u32,
-        scroll_y: u32,
-        view_w: u32,
-        view_h: u32,
-    ) -> (u32, u32, u32, u32) {
-        let x = scroll_x.min(self.width.saturating_sub(1));
-        let y = scroll_y
-            .saturating_sub(self.origin_y)
-            .min(self.height.saturating_sub(1));
-        let w = view_w.min(self.width.saturating_sub(x)).max(1);
-        let h = view_h.min(self.height.saturating_sub(y)).max(1);
-        (x, y, w, h)
-    }
+/// Vertical scroll is kept on whole cell rows so tile edges stay on cell edges.
+/// Rounds down so a jump target is never cut off at the top.
+fn snap_scroll(scroll: f32, cell: f32, max: f32) -> f32 {
+    let cell = cell.max(1.0);
+    let snapped = ((scroll / cell) + 1e-3).floor() * cell;
+    snapped.clamp(0.0, max.max(0.0))
 }
 
 fn px(value: f32) -> u32 {
@@ -1015,19 +1225,6 @@ fn px(value: f32) -> u32 {
 fn cells_for(pixels: u32, cell: u32, window: u16) -> u32 {
     let count = (pixels as f32 / cell.max(1) as f32).round() as u32;
     count.clamp(1, u32::from(window.max(1)))
-}
-
-/// Vertical slice of the page to upload. Scrolling inside it is only a place command.
-fn strip_window(scroll: u32, view: u32, page: u32) -> (u32, u32) {
-    let page = page.max(1);
-    let view = view.clamp(1, page);
-    let strip = view.saturating_mul(6).clamp(view, 8192).min(page);
-    let mut origin = scroll.saturating_sub(strip.saturating_sub(view) / 2);
-    let max_origin = page.saturating_sub(strip);
-    if origin > max_origin {
-        origin = max_origin;
-    }
-    (origin, strip)
 }
 
 #[cfg(test)]
@@ -1059,27 +1256,94 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_inside_the_uploaded_page_does_not_need_a_new_image() {
-        let (origin, strip) = strip_window(100, 500, 800);
-        assert_eq!((origin, strip), (0, 800));
-        let shown = Shown {
-            id: 1,
-            origin_y: origin,
-            width: 1200,
-            height: strip,
-        };
-        assert!(shown.covers(0, 100, 1200, 500));
-        assert_eq!(shown.source(0, 100, 1200, 500), (0, 100, 1200, 500));
+    fn tiles_are_whole_cell_rows() {
+        // 768 px target at 20 px cells: 38 rows, 760 px.
+        assert_eq!(tile_rows(20), 38);
+        assert_eq!(tile_rows(18) * 18, 756);
+        // A cell taller than the target still gives one row.
+        assert_eq!(tile_rows(900), 1);
+    }
 
-        let (origin, strip) = strip_window(5_000, 1_000, 20_000);
-        let shown = Shown {
-            id: 1,
-            origin_y: origin,
-            width: 800,
-            height: strip,
-        };
-        assert!(shown.covers(0, 5_000, 800, 1_000));
-        assert!(shown.covers(0, 6_000, 800, 1_000));
-        assert!(!shown.covers(0, 0, 800, 1_000));
+    #[test]
+    fn the_page_is_padded_to_a_cell_edge_and_at_least_a_view() {
+        assert_eq!(padded_height(1001, 400, 20), 1020);
+        assert_eq!(padded_height(1000, 400, 20), 1000);
+        assert_eq!(padded_height(100, 400, 20), 400);
+    }
+
+    #[test]
+    fn only_tiles_that_overlap_the_view_are_visible() {
+        // Tiles of 100 px, five of them.
+        assert_eq!(visible_tiles(0, 250, 100, 5), 0..3);
+        assert_eq!(visible_tiles(100, 100, 100, 5), 1..2);
+        assert_eq!(visible_tiles(150, 100, 100, 5), 1..3);
+        assert_eq!(visible_tiles(400, 100, 100, 5), 4..5);
+        // A view past the end never asks for tiles that do not exist.
+        assert_eq!(visible_tiles(450, 200, 100, 5), 4..5);
+    }
+
+    #[test]
+    fn the_keep_range_covers_the_view_with_more_room_below() {
+        let keep = keep_tiles(1000, 400, 100, 40);
+        assert!(keep.start <= 10 && keep.end >= 14);
+        assert!(1000 - keep.start * 100 < 400);
+        assert!(keep.end * 100 - 1400 >= 300);
+        assert_eq!(keep_tiles(0, 400, 100, 3), 0..3);
+    }
+
+    #[test]
+    fn a_partly_visible_tile_is_cut_to_the_view() {
+        // View 400 px at scroll 150, tiles of 100 px.
+        let spot = |index| place_tile(index, 150, 400, 100, 100);
+        assert_eq!(spot(0), None);
+        assert_eq!(
+            spot(1),
+            Some(Spot {
+                top: 0,
+                src_y: 50,
+                height: 50
+            })
+        );
+        assert_eq!(
+            spot(2),
+            Some(Spot {
+                top: 50,
+                src_y: 0,
+                height: 100
+            })
+        );
+        assert_eq!(
+            spot(5),
+            Some(Spot {
+                top: 350,
+                src_y: 0,
+                height: 50
+            })
+        );
+        assert_eq!(spot(6), None);
+    }
+
+    #[test]
+    fn visible_tiles_fill_the_view_with_no_gap_or_overlap() {
+        let (view, tile, page) = (400, 100, 1000);
+        for scroll in (0..=600).step_by(20) {
+            let mut next = 0;
+            for index in visible_tiles(scroll, view, tile, page / tile) {
+                let spot = place_tile(index, scroll, view, tile, tile).expect("visible");
+                assert_eq!(spot.top, next, "scroll {scroll} tile {index}");
+                next += spot.height;
+            }
+            assert_eq!(next, view, "scroll {scroll}");
+        }
+    }
+
+    #[test]
+    fn scroll_lands_on_cell_rows_and_never_past_the_ends() {
+        assert_eq!(snap_scroll(61.0, 20.0, 1000.0), 60.0);
+        assert_eq!(snap_scroll(60.0, 20.0, 1000.0), 60.0);
+        assert_eq!(snap_scroll(-5.0, 20.0, 1000.0), 0.0);
+        assert_eq!(snap_scroll(5000.0, 20.0, 1000.0), 1000.0);
+        // Float error from accumulated scrolling must not drop a whole row.
+        assert_eq!(snap_scroll(59.9999, 20.0, 1000.0), 60.0);
     }
 }
