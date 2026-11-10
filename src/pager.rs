@@ -25,9 +25,7 @@ use crate::nav::{Nav, resolve_link};
 use crate::page::{
     Rect, anchor_y, change_scroll_y, frame_for_change, hit_link, hit_toggle, selected_text,
 };
-use crate::protocol::{
-    SourceRect, delete_image, delete_placements, place_image, transmit_png,
-};
+use crate::protocol::{SourceRect, delete_image, delete_placements, place_image, transmit_png};
 use crate::render::{Renderer, StatusBar, Theme, ThemeChoice, crop_pixmap, fill_rect};
 use crate::terminal::{self as term, DisplayInfo, ScreenGuard};
 
@@ -1202,7 +1200,7 @@ fn place_tile(index: u32, scroll: u32, view_h: u32, tile_px: u32, tile_h: u32) -
     let tile_top = index * tile_px;
     let top = tile_top.max(scroll);
     let bottom = (tile_top + tile_h).min(scroll + view_h);
-    (bottom > top).then_some(Spot {
+    (bottom > top).then(|| Spot {
         top: top - scroll,
         src_y: top - tile_top,
         height: bottom - top,

@@ -178,7 +178,9 @@ mod tests {
     #[test]
     fn attributes_query_is_last_and_its_reply_ends_the_probe() {
         assert!(super::probe_query().ends_with("\u{1b}[c"));
-        assert!(super::has_attributes_reply("\u{1b}_Gi=31;OK\u{1b}\\\u{1b}[?62;4c"));
+        assert!(super::has_attributes_reply(
+            "\u{1b}_Gi=31;OK\u{1b}\\\u{1b}[?62;4c"
+        ));
         assert!(!super::has_attributes_reply("\u{1b}[6;20;10t"));
         assert!(!super::has_attributes_reply("\u{1b}[?62;4"));
     }

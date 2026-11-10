@@ -13,8 +13,8 @@ use crossterm::terminal::{
 };
 
 use crate::protocol::{
-    delete_image, has_attributes_reply, parse_background, parse_cell_size, parse_palette, parse_window_pixels,
-    probe_query, supports_graphics,
+    delete_image, has_attributes_reply, parse_background, parse_cell_size, parse_palette,
+    parse_window_pixels, probe_query, supports_graphics,
 };
 
 pub struct DisplayInfo {
